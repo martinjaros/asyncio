@@ -12,40 +12,40 @@
 
 #define STACK_SIZE 0x800000
 
-static int epfd;
-static ucontext_t ucp_main;
-static ucontext_t *ucp_pending = NULL;
-static ucontext_t *ucp_cleanup = NULL;
-static size_t ucp_count = 0;
+static int epfd = -1;
+static ucontext_t ctx_main;
+static ucontext_t *ctx_pending = NULL;
+static ucontext_t *ctx_cleanup = NULL;
+static size_t ctx_count = 0;
 
 static inline void dispatch()
 {
-    if(ucp_pending)
+    if(ctx_pending)
     {
-        ucontext_t *ucp = ucp_pending;
-        ucp_pending = ucp->uc_link;
-        setcontext(ucp);
+        ucontext_t *ctx = ctx_pending;
+        ctx_pending = ctx->uc_link;
+        setcontext(ctx);
     }
 }
 
 static inline void cleanup()
 {
-    if(ucp_cleanup)
+    if(ctx_cleanup)
     {
-        free(ucp_cleanup);
-        ucp_cleanup = NULL;
+        free(ctx_cleanup);
+        ctx_cleanup = NULL;
     }
 }
 
-static void startup(ucontext_t *ucp, void (*func)(void *args), void *args)
+static void startup(ucontext_t *ctx, void (*func)(void *args), void *args)
 {
     cleanup();
 
     func(args);
 
-    ucp_cleanup = ucp;
-    if(--ucp_count == 0)
-        setcontext(&ucp_main);
+    ctx_cleanup = ctx;
+    if(--ctx_count == 0)
+        setcontext(&ctx_main);
 
     dispatch();
 
@@ -56,24 +56,25 @@ static void startup(ucontext_t *ucp, void (*func)(void *args), void *args)
 
 void async_create(void (*func)(void *args), void *args)
 {
-    ucontext_t *ucp = malloc(STACK_SIZE);
+    ucontext_t *ctx = malloc(STACK_SIZE);
 
-    getcontext(ucp);
-    ucp->uc_stack.ss_sp = (void*)ucp + sizeof(ucontext_t);
-    ucp->uc_stack.ss_size = STACK_SIZE - sizeof(ucontext_t);
-    ucp->uc_link = ucp_pending;
-    ucp_pending = ucp;
-    ucp_count++;
+    getcontext(ctx);
+    ctx->uc_stack.ss_sp = (void*)ctx + sizeof(ucontext_t);
+    ctx->uc_stack.ss_size = STACK_SIZE - sizeof(ucontext_t);
+    ctx->uc_link = ctx_pending;
+    ctx_pending = ctx;
+    ctx_count++;
 
-    makecontext(ucp, (void(*)())startup, 3, ucp, func, args);
+    makecontext(ctx, (void(*)())startup, 3, ctx, func, args);
 }
 
 void async_wait(int fd, int dir)
 {
+    if(epfd == -1) return;
     volatile int flag = 0;
 
-    ucontext_t ucp;
-    getcontext(&ucp);
+    ucontext_t ctx;
+    getcontext(&ctx);
     if(flag)
     {
         cleanup();
@@ -81,8 +82,9 @@ void async_wait(int fd, int dir)
         return;
     }
 
-    struct epoll_event event = { dir ? EPOLLOUT : EPOLLIN, { &ucp } };
-    epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &event);
+    struct epoll_event event = { dir ? EPOLLOUT : EPOLLIN, { &ctx } };
+    if(epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &event) != 0)
+        return; // return if fd is waited upon by another context; caller should dup()
 
     flag = 1;
     dispatch();
@@ -93,6 +95,7 @@ void async_wait(int fd, int dir)
 
 void async_sleep(unsigned long usec)
 {
+    if(epfd == -1) return;
     int fd = timerfd_create(CLOCK_MONOTONIC, 0);
 
     struct itimerspec it = { { 0, 0 }, { usec / 1000000, usec % 1000000 * 1000 } };
@@ -104,16 +107,21 @@ void async_sleep(unsigned long usec)
 
 void async_main()
 {
+    if(epfd != -1) return;
     epfd = epoll_create1(0);
 
     volatile int flag = 0;
-    getcontext(&ucp_main);
+    getcontext(&ctx_main);
     if(flag)
     {
         cleanup();
-        return;
+        goto out;
     }
 
     flag = 1;
     dispatch();
+
+out:
+    close(epfd);
+    epfd = -1;
 }
