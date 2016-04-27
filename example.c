@@ -7,34 +7,31 @@
 #include <unistd.h>
 #include "asyncio.h"
 
+#define read(fd, buf, n) ({ async_wait(fd, ASYNC_READ); read(fd, buf, n); })
+#define write(fd, buf, n) ({ async_wait(fd, ASYNC_WRITE); write(fd, buf, n); })
+#define usleep(n) async_sleep(n)
+
 static void reader(void *arg)
 {
-    int i, fd = *(int*)arg;
+    int fd = *(int*)arg;
 
-    while(1)
-    {
-        async_wait(fd, ASYNC_READ);
-
-        if(read(fd, &i, sizeof(i)) == 0)
-        {
-            close(fd);
-            return;
-        }
-
+    int i;
+    while(read(fd, &i, sizeof(i)) > 0)
         printf("read %d\n", i);
-    }
+
+    close(fd);
 }
 
 static void writer(void *arg)
 {
-    int i, fd = *(int*)arg;
+    int fd = *(int*)arg;
 
+    int i;
     for(i = 0; i < 3; i++)
     {
         printf("write %d\n", i);
         write(fd, &i, sizeof(i));
-
-        async_sleep(500000); // 0.5s
+        usleep(500000);
     }
 
     close(fd);

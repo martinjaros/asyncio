@@ -3,6 +3,7 @@
  * Public domain.
  */
 
+#include <errno.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <ucontext.h>
@@ -10,44 +11,44 @@
 #include <sys/timerfd.h>
 #include "asyncio.h"
 
+#include <valgrind/valgrind.h>
+
 #define STACK_SIZE 0x800000
 
-static int epfd = -1;
-static ucontext_t ctx_main;
-static ucontext_t *ctx_pending = NULL;
-static ucontext_t *ctx_cleanup = NULL;
-static size_t ctx_count = 0;
+static int epfd = -1; // global epoll instance
+static unsigned long task_count = 0; // number of allocated tasks
+static void *trash = NULL; // memory chunk of a previously terminated task
+static ucontext_t *ucp_main = NULL; // main context
+static ucontext_t *ucp_next = NULL; // list of pending contexts
 
-static inline void dispatch()
+static inline void clear(void **ptr)
 {
-    if(ctx_pending)
+    if(*ptr)
     {
-        ucontext_t *ctx = ctx_pending;
-        ctx_pending = ctx->uc_link;
-        setcontext(ctx);
+        free(*ptr);
+        *ptr = NULL;
     }
 }
 
-static inline void cleanup()
+static void startup(void *stack_top, unsigned long long stack_id, void (*func)(void *args), void *args)
 {
-    if(ctx_cleanup)
-    {
-        free(ctx_cleanup);
-        ctx_cleanup = NULL;
-    }
-}
-
-static void startup(ucontext_t *ctx, void (*func)(void *args), void *args)
-{
-    cleanup();
-
+    clear(&trash);
     func(args);
+    trash = stack_top;
 
-    ctx_cleanup = ctx;
-    if(--ctx_count == 0)
-        setcontext(&ctx_main);
+#ifdef __VALGRIND_H
+    VALGRIND_STACK_DEREGISTER(stack_id);
+#endif
 
-    dispatch();
+    if((--task_count == 0) && ucp_main)
+        setcontext(ucp_main);
+
+    if(ucp_next)
+    {
+        ucontext_t *ucp = ucp_next;
+        ucp_next = ucp->uc_link;
+        setcontext(ucp);
+    }
 
     struct epoll_event event;
     while(epoll_wait(epfd, &event, 1, -1) != 1);
@@ -56,47 +57,66 @@ static void startup(ucontext_t *ctx, void (*func)(void *args), void *args)
 
 void async_create(void (*func)(void *args), void *args)
 {
-    ucontext_t *ctx = malloc(STACK_SIZE);
+    void *stack_top = malloc(STACK_SIZE);
+    unsigned long long stack_id = 0;
 
-    getcontext(ctx);
-    ctx->uc_stack.ss_sp = (void*)ctx + sizeof(ucontext_t);
-    ctx->uc_stack.ss_size = STACK_SIZE - sizeof(ucontext_t);
-    ctx->uc_link = ctx_pending;
-    ctx_pending = ctx;
-    ctx_count++;
+#ifdef __VALGRIND_H
+    stack_id = VALGRIND_STACK_REGISTER(stack_top, stack_top + STACK_SIZE - 1);
+#endif
 
-    makecontext(ctx, (void(*)())startup, 3, ctx, func, args);
+    ucontext_t *ucp = stack_top + STACK_SIZE - sizeof(ucontext_t);
+
+    getcontext(ucp);
+    ucp->uc_stack.ss_sp = stack_top;
+    ucp->uc_stack.ss_size = STACK_SIZE;
+    makecontext(ucp, (void(*)())startup, 4, stack_top, stack_id, func, args);
+
+    ucp->uc_link = ucp_next;
+    ucp_next = ucp;
+    task_count++;
 }
 
 void async_wait(int fd, int dir)
 {
+    if(epfd == -1) epfd = epoll_create1(EPOLL_CLOEXEC);
     if(epfd == -1) return;
-    volatile int flag = 0;
 
     ucontext_t ctx;
-    getcontext(&ctx);
-    if(flag)
+    struct epoll_event event = { dir ? EPOLLOUT : EPOLLIN, { &ctx } };
+    if(epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &event) != 0)
     {
-        cleanup();
-        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+        if(errno == EEXIST)
+        {
+            int fd2 = dup(fd);
+            async_wait(fd2, dir);
+            close(fd2);
+        }
+
         return;
     }
 
-    struct epoll_event event = { dir ? EPOLLOUT : EPOLLIN, { &ctx } };
-    if(epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &event) != 0)
-        return; // return if fd is waited upon by another context; caller should dup()
+    if(ucp_next)
+    {
+        ucontext_t *ucp = ucp_next;
+        ucp_next = ucp->uc_link;
+        swapcontext(&ctx, ucp);
+    }
+    else
+    {
+        struct epoll_event event;
+        while(epoll_wait(epfd, &event, 1, -1) != 1);
+        if(&ctx != event.data.ptr)
+            swapcontext(&ctx, event.data.ptr);
+    }
 
-    flag = 1;
-    dispatch();
-
-    while(epoll_wait(epfd, &event, 1, -1) != 1);
-    setcontext(event.data.ptr);
+    clear(&trash);
+    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
 }
 
 void async_sleep(unsigned long usec)
 {
-    if(epfd == -1) return;
-    int fd = timerfd_create(CLOCK_MONOTONIC, 0);
+    int fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
+    if(fd == -1) return;
 
     struct itimerspec it = { { 0, 0 }, { usec / 1000000, usec % 1000000 * 1000 } };
     timerfd_settime(fd, 0, &it, NULL);
@@ -107,21 +127,24 @@ void async_sleep(unsigned long usec)
 
 void async_main()
 {
-    if(epfd != -1) return;
-    epfd = epoll_create1(0);
+    if(ucp_main) return;
 
-    volatile int flag = 0;
-    getcontext(&ctx_main);
-    if(flag)
+    if(ucp_next)
     {
-        cleanup();
-        goto out;
+        ucontext_t ctx;
+        ucp_main = &ctx;
+
+        ucontext_t *ucp = ucp_next;
+        ucp_next = ucp->uc_link;
+        swapcontext(&ctx, ucp);
+
+        clear(&trash);
+        ucp_main = NULL;
     }
 
-    flag = 1;
-    dispatch();
-
-out:
-    close(epfd);
-    epfd = -1;
+    if(epfd != -1)
+    {
+        close(epfd);
+        epfd = -1;
+    }
 }
